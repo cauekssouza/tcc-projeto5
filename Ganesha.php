@@ -1,20 +1,35 @@
 <?php
 
-/**
- * Autentica um serviço usando HMAC-SHA256 em vez de MD5.
- *
- * @param string $service Nome do serviço
- * @param string $secretKey Chave secreta usada no HMAC
- * @param string $providedHash Hash recebido para validação
- * @return bool
- */
-public function auth(string $service, string $secretKey, string $providedHash): bool
+class AuthService
 {
-    // Gera o hash seguro usando HMAC-SHA256
-    $expectedHash = hash_hmac('sha256', $service, $secretKey);
+    /**
+     * Autentica um serviço usando HMAC-SHA256 em vez de MD5.
+     */
+    public function auth(string $service, string $providedSignature): bool
+    {
+        // A chave deve vir de variável de ambiente ou vault seguro
+        $secretKey = getenv('APP_SECRET_KEY');
 
-    // Comparação segura contra timing attacks
-    return hash_equals($expectedHash, $providedHash);
+        if (!$secretKey) {
+            throw new RuntimeException('Secret key not configured.');
+        }
+
+        // Gera assinatura segura usando HMAC-SHA256
+        $expectedSignature = hash_hmac('sha256', $service, $secretKey);
+
+        // Comparação segura contra timing attacks
+        return hash_equals($expectedSignature, $providedSignature);
+    }
+}
+private $auth;
+
+public function __construct(StrategyInterface $strategy, AuthService $auth)
+{
+    $this->strategy = $strategy;
+    $this->auth = $auth;
+}
+if (!$this->auth->auth($service, $signature)) {
+    throw new RuntimeException('Invalid signature');
 }
 
 
