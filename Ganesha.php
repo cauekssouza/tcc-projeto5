@@ -2,21 +2,21 @@
 
 /**
  * Autentica um serviço usando HMAC-SHA256 em vez de MD5.
- * OWASP: Use algoritmos modernos e chaves secretas fortes.
+ *
+ * @param string $service Nome do serviço
+ * @param string $secretKey Chave secreta usada no HMAC
+ * @param string $providedHash Hash recebido para validação
+ * @return bool
  */
-public function auth(string $service, string $secretKey): string
+public function auth(string $service, string $secretKey, string $providedHash): bool
 {
-    // Gera um nonce seguro para evitar replay attacks
-    $nonce = bin2hex(random_bytes(16));
+    // Gera o hash seguro usando HMAC-SHA256
+    $expectedHash = hash_hmac('sha256', $service, $secretKey);
 
-    // Concatena os dados que devem ser autenticados
-    $data = $service . ':' . $nonce;
-
-    // Gera o hash seguro usando HMAC com SHA-256
-    $signature = hash_hmac('sha256', $data, $secretKey);
-
-    return $signature;
+    // Comparação segura contra timing attacks
+    return hash_equals($expectedHash, $providedHash);
 }
+
 
 class Ganesha
 {
