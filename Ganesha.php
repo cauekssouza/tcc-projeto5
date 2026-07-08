@@ -2,14 +2,34 @@
 
 declare(strict_types=1);
 
+interface StrategyInterface
+{
+    public function recordFailure(string $service): int;
+    public function recordSuccess(string $service): int;
+    public function isAvailable(string $service): bool;
+    public function reset(): void;
+}
+
+class StorageException extends \RuntimeException
+{
+}
+
 final class Ganesha
 {
     /**
      * @var string
      */
-    public const EVENT_TRIPPED        = 'tripped';
-    public const EVENT_CALMED_DOWN    = 'calmed_down';
-    public const EVENT_STORAGE_ERROR  = 'storage_error';
+    public const EVENT_TRIPPED = 'tripped';
+
+    /**
+     * @var string
+     */
+    public const EVENT_CALMED_DOWN = 'calmed_down';
+
+    /**
+     * @var string
+     */
+    public const EVENT_STORAGE_ERROR = 'storage_error';
 
     /**
      * the status between failure count 0 and trip.
@@ -21,7 +41,7 @@ final class Ganesha
      * the status between trip and calm down.
      * @var int
      */
-    public const STATUS_TRIPPED = 2;
+    public const STATUS_TRIPPED  = 2;
 
     /**
      * @var StrategyInterface
@@ -55,12 +75,13 @@ final class Ganesha
                 $this->notify(self::EVENT_TRIPPED, $service, '');
             }
         } catch (StorageException $e) {
-            // Não expor detalhes internos da exceção diretamente
-            $safeMessage = 'failed to record failure';
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, $safeMessage);
-
-            // Opcional: logar detalhes técnicos em canal seguro
-            // error_log('StorageException in failure(): ' . $e->getMessage());
+            // Não expor detalhes internos da exceção
+            $this->notify(
+                self::EVENT_STORAGE_ERROR,
+                $service,
+                'failed to record failure'
+            );
+            // Opcional: logar detalhes em canal seguro (logger, syslog etc.)
         }
     }
 
@@ -76,11 +97,12 @@ final class Ganesha
                 $this->notify(self::EVENT_CALMED_DOWN, $service, '');
             }
         } catch (StorageException $e) {
-            $safeMessage = 'failed to record success';
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, $safeMessage);
-
-            // Opcional: logar detalhes técnicos
-            // error_log('StorageException in success(): ' . $e->getMessage());
+            $this->notify(
+                self::EVENT_STORAGE_ERROR,
+                $service,
+                'failed to record success'
+            );
+            // Opcional: logar detalhes internos em canal seguro
         }
     }
 
@@ -93,12 +115,12 @@ final class Ganesha
         try {
             return $this->strategy->isAvailable($service);
         } catch (StorageException $e) {
-            $safeMessage = 'failed to check availability';
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, $safeMessage);
-
-            // fail-silent: assume disponível, mas loga internamente
-            // error_log('StorageException in isAvailable(): ' . $e->getMessage());
-
+            $this->notify(
+                self::EVENT_STORAGE_ERROR,
+                $service,
+                'failed to check availability'
+            );
+            // fail-silent: não derruba o sistema por erro de storage
             return true;
         }
     }
@@ -108,14 +130,30 @@ final class Ganesha
      */
     public function subscribe(callable $callable): void
     {
-        // Opcional: validar assinatura do callable via reflexão ou wrapper
+        // Opcional: validar que o callable é realmente chamável
+        if (!\is_callable($callable)) {
+            throw new \InvalidArgumentException('Subscriber must be callable.');
+        }
+
         $this->subscribers[] = $callable;
     }
 
     private function notify(string $event, string $service, string $message): void
     {
+        // Validar evento para evitar uso indevido
+        $allowedEvents = [
+            self::EVENT_TRIPPED,
+            self::EVENT_CALMED_DOWN,
+            self::EVENT_STORAGE_ERROR,
+        ];
+
+        if (!\in_array($event, $allowedEvents, true)) {
+            // Ignora eventos inválidos ou lança exceção, dependendo da política
+            return;
+        }
+
         foreach ($this->subscribers as $subscriber) {
-            // Evitar call_user_func_array por questões de performance e legibilidade
+            // Chamada direta é mais segura e performática que call_user_func_array
             $subscriber($event, $service, $message);
         }
     }
@@ -141,7 +179,6 @@ final class Ganesha
      */
     public function reset(): void
     {
-        // Se reset puder lançar StorageException, considerar try/catch aqui também
         $this->strategy->reset();
     }
 }
