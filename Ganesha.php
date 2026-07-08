@@ -44,18 +44,6 @@ class Ganesha
      */
     private static $disabled = false;
 
-    /**
-     * Lightweight inter‑process lock file path.
-     *
-     * @var string
-     */
-    private static $lockFile = __DIR__ . '/ganesha.lock';
-
-    /**
-     * @var resource|null
-     */
-    private static $lockHandle;
-
     public function __construct(StrategyInterface $strategy)
     {
         $this->strategy = $strategy;
@@ -66,25 +54,18 @@ class Ganesha
      */
     public function failure(string $service): void
     {
-        if (!$this->acquireLock()) {
-            // If we cannot safely coordinate counters, avoid mutating state
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to acquire lock for failure');
-            return;
-        }
-
-        try {
-            $status = $this->strategy->recordFailure($service);
-            if ($status === self::STATUS_TRIPPED) {
-                $this->notify(self::EVENT_TRIPPED, $service, '');
+        $this->withSafeStorage(
+            $service,
+            'failed to record failure',
+            function () use ($service): ?int {
+                return $this->strategy->recordFailure($service);
+            },
+            function (?int $status) use ($service): void {
+                if ($status === self::STATUS_TRIPPED) {
+                    $this->notify(self::EVENT_TRIPPED, $service, '');
+                }
             }
-        } catch (StorageException $e) {
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to record failure : ' . $e->getMessage());
-        } catch (\Throwable $e) {
-            // Defensive catch for any unexpected adapter error
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'unexpected error on failure : ' . $e->getMessage());
-        } finally {
-            $this->releaseLock();
-        }
+        );
     }
 
     /**
@@ -92,23 +73,18 @@ class Ganesha
      */
     public function success(string $service): void
     {
-        if (!$this->acquireLock()) {
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to acquire lock for success');
-            return;
-        }
-
-        try {
-            $status = $this->strategy->recordSuccess($service);
-            if ($status === self::STATUS_CALMED_DOWN) {
-                $this->notify(self::EVENT_CALMED_DOWN, $service, '');
+        $this->withSafeStorage(
+            $service,
+            'failed to record success',
+            function () use ($service): ?int {
+                return $this->strategy->recordSuccess($service);
+            },
+            function (?int $status) use ($service): void {
+                if ($status === self::STATUS_CALMED_DOWN) {
+                    $this->notify(self::EVENT_CALMED_DOWN, $service, '');
+                }
             }
-        } catch (StorageException $e) {
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to record success : ' . $e->getMessage());
-        } catch (\Throwable $e) {
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'unexpected error on success : ' . $e->getMessage());
-        } finally {
-            $this->releaseLock();
-        }
+        );
     }
 
     public function isAvailable(string $service): bool
@@ -117,24 +93,15 @@ class Ganesha
             return true;
         }
 
-        if (!$this->acquireLock()) {
-            // Conservative default: protect infrastructure when coordination fails
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to acquire lock for isAvailable');
-            return false;
-        }
-
-        try {
-            return $this->strategy->isAvailable($service);
-        } catch (StorageException $e) {
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to isAvailable : ' . $e->getMessage());
-            // Fail‑closed to avoid resource exhaustion when storage is unstable
-            return false;
-        } catch (\Throwable $e) {
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'unexpected error on isAvailable : ' . $e->getMessage());
-            return false;
-        } finally {
-            $this->releaseLock();
-        }
+        return $this->withSafeStorage(
+            $service,
+            'failed to isAvailable',
+            function () use ($service): bool {
+                return $this->strategy->isAvailable($service);
+            },
+            null,
+            true // fail-open default
+        );
     }
 
     /**
@@ -148,7 +115,12 @@ class Ganesha
     private function notify(string $event, string $service, string $message): void
     {
         foreach ($this->subscribers as $s) {
-            call_user_func_array($s, [$event, $service, $message]);
+            try {
+                call_user_func_array($s, [$event, $service, $message]);
+            } catch (\Throwable $e) {
+                // Protect availability: subscriber failures must not impact circuit breaker behavior
+                // Optionally, could route this to a dedicated logging subscriber if configured
+            }
         }
     }
 
@@ -173,56 +145,57 @@ class Ganesha
      */
     public function reset(): void
     {
-        if (!$this->acquireLock()) {
-            $this->notify(self::EVENT_STORAGE_ERROR, 'global', 'failed to acquire lock for reset');
-            return;
-        }
+        $this->withSafeStorage(
+            '',
+            'failed to reset strategy',
+            function (): void {
+                $this->strategy->reset();
+            }
+        );
+    }
 
+    /**
+     * Centralized, robust storage adapter protection.
+     *
+     * @template T
+     * @param string        $service
+     * @param string        $contextMessage
+     * @param callable      $operation   fn(): T
+     * @param callable|null $onResult    fn(T|null): void
+     * @param mixed         $default     default value when storage fails (for availability, fail-open)
+     * @return mixed
+     */
+    private function withSafeStorage(
+        string $service,
+        string $contextMessage,
+        callable $operation,
+        ?callable $onResult = null,
+        $default = null
+    ) {
         try {
-            $this->strategy->reset();
+            // Single, atomic call into the strategy to avoid userland race conditions.
+            $result = $operation();
+
+            if ($onResult !== null) {
+                $onResult($result);
+            }
+
+            return $result ?? $default;
         } catch (StorageException $e) {
-            $this->notify(self::EVENT_STORAGE_ERROR, 'global', 'failed to reset : ' . $e->getMessage());
+            $this->notify(
+                self::EVENT_STORAGE_ERROR,
+                $service,
+                $contextMessage . ' : ' . $e->getMessage()
+            );
+            return $default;
         } catch (\Throwable $e) {
-            $this->notify(self::EVENT_STORAGE_ERROR, 'global', 'unexpected error on reset : ' . $e->getMessage());
-        } finally {
-            $this->releaseLock();
-        }
-    }
-
-    /**
-     * Acquire a simple cross‑process lock to mitigate race conditions
-     * on counters and state transitions.
-     */
-    private function acquireLock(): bool
-    {
-        if (self::$lockHandle === null) {
-            self::$lockHandle = @fopen(self::$lockFile, 'c');
-            if (self::$lockHandle === false) {
-                self::$lockHandle = null;
-                return false;
-            }
-        }
-
-        $start = microtime(true);
-        $timeoutSeconds = 0.05; // small timeout to avoid threads stuck in retention loops
-
-        do {
-            if (@flock(self::$lockHandle, LOCK_EX | LOCK_NB)) {
-                return true;
-            }
-            usleep(1000); // brief backoff to reduce contention
-        } while ((microtime(true) - $start) < $timeoutSeconds);
-
-        return false;
-    }
-
-    /**
-     * Release the previously acquired lock.
-     */
-    private function releaseLock(): void
-    {
-        if (self::$lockHandle !== null) {
-            @flock(self::$lockHandle, LOCK_UN);
+            // Catch-all to prevent adapter or unexpected errors from crashing the main application.
+            $this->notify(
+                self::EVENT_STORAGE_ERROR,
+                $service,
+                $contextMessage . ' (unexpected error) : ' . $e->getMessage()
+            );
+            return $default;
         }
     }
 }
