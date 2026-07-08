@@ -44,6 +44,18 @@ class Ganesha
      */
     private static $disabled = false;
 
+    /**
+     * Lightweight inter‑process lock file path.
+     *
+     * @var string
+     */
+    private static $lockFile = __DIR__ . '/ganesha.lock';
+
+    /**
+     * @var resource|null
+     */
+    private static $lockHandle;
+
     public function __construct(StrategyInterface $strategy)
     {
         $this->strategy = $strategy;
@@ -54,27 +66,25 @@ class Ganesha
      */
     public function failure(string $service): void
     {
-        self::withServiceLock($service, function () use ($service): void {
-            try {
-                $status = $this->strategy->recordFailure($service);
-                if ($status === self::STATUS_TRIPPED) {
-                    $this->notify(self::EVENT_TRIPPED, $service, '');
-                }
-            } catch (StorageException $e) {
-                $this->notify(
-                    self::EVENT_STORAGE_ERROR,
-                    $service,
-                    'failed to record failure : ' . $e->getMessage()
-                );
-            } catch (\Throwable $e) {
-                // Defensive catch to avoid crashes from unexpected adapter errors
-                $this->notify(
-                    self::EVENT_STORAGE_ERROR,
-                    $service,
-                    'unexpected error while recording failure : ' . $e->getMessage()
-                );
+        if (!$this->acquireLock()) {
+            // If we cannot safely coordinate counters, avoid mutating state
+            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to acquire lock for failure');
+            return;
+        }
+
+        try {
+            $status = $this->strategy->recordFailure($service);
+            if ($status === self::STATUS_TRIPPED) {
+                $this->notify(self::EVENT_TRIPPED, $service, '');
             }
-        });
+        } catch (StorageException $e) {
+            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to record failure : ' . $e->getMessage());
+        } catch (\Throwable $e) {
+            // Defensive catch for any unexpected adapter error
+            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'unexpected error on failure : ' . $e->getMessage());
+        } finally {
+            $this->releaseLock();
+        }
     }
 
     /**
@@ -82,27 +92,23 @@ class Ganesha
      */
     public function success(string $service): void
     {
-        self::withServiceLock($service, function () use ($service): void {
-            try {
-                $status = $this->strategy->recordSuccess($service);
-                if ($status === self::STATUS_CALMED_DOWN) {
-                    $this->notify(self::EVENT_CALMED_DOWN, $service, '');
-                }
-            } catch (StorageException $e) {
-                $this->notify(
-                    self::EVENT_STORAGE_ERROR,
-                    $service,
-                    'failed to record success : ' . $e->getMessage()
-                );
-            } catch (\Throwable $e) {
-                // Defensive catch to avoid crashes from unexpected adapter errors
-                $this->notify(
-                    self::EVENT_STORAGE_ERROR,
-                    $service,
-                    'unexpected error while recording success : ' . $e->getMessage()
-                );
+        if (!$this->acquireLock()) {
+            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to acquire lock for success');
+            return;
+        }
+
+        try {
+            $status = $this->strategy->recordSuccess($service);
+            if ($status === self::STATUS_CALMED_DOWN) {
+                $this->notify(self::EVENT_CALMED_DOWN, $service, '');
             }
-        });
+        } catch (StorageException $e) {
+            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to record success : ' . $e->getMessage());
+        } catch (\Throwable $e) {
+            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'unexpected error on success : ' . $e->getMessage());
+        } finally {
+            $this->releaseLock();
+        }
     }
 
     public function isAvailable(string $service): bool
@@ -111,29 +117,24 @@ class Ganesha
             return true;
         }
 
-        return (bool) self::withServiceLock($service, function () use ($service): bool {
-            try {
-                return $this->strategy->isAvailable($service);
-            } catch (StorageException $e) {
-                // Storage failure: protect infrastructure by treating service as unavailable
-                $this->notify(
-                    self::EVENT_STORAGE_ERROR,
-                    $service,
-                    'failed to isAvailable : ' . $e->getMessage()
-                );
-                $this->notify(self::EVENT_TRIPPED, $service, 'tripped due to storage error');
-                return false;
-            } catch (\Throwable $e) {
-                // Any unexpected adapter error should not crash the app
-                $this->notify(
-                    self::EVENT_STORAGE_ERROR,
-                    $service,
-                    'unexpected error in isAvailable : ' . $e->getMessage()
-                );
-                $this->notify(self::EVENT_TRIPPED, $service, 'tripped due to unexpected storage error');
-                return false;
-            }
-        });
+        if (!$this->acquireLock()) {
+            // Conservative default: protect infrastructure when coordination fails
+            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to acquire lock for isAvailable');
+            return false;
+        }
+
+        try {
+            return $this->strategy->isAvailable($service);
+        } catch (StorageException $e) {
+            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to isAvailable : ' . $e->getMessage());
+            // Fail‑closed to avoid resource exhaustion when storage is unstable
+            return false;
+        } catch (\Throwable $e) {
+            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'unexpected error on isAvailable : ' . $e->getMessage());
+            return false;
+        } finally {
+            $this->releaseLock();
+        }
     }
 
     /**
@@ -147,12 +148,7 @@ class Ganesha
     private function notify(string $event, string $service, string $message): void
     {
         foreach ($this->subscribers as $s) {
-            try {
-                call_user_func_array($s, [$event, $service, $message]);
-            } catch (\Throwable $e) {
-                // Never let a subscriber crash the main flow; best-effort notification only
-                // Optionally, one could route this to a dedicated logging subscriber.
-            }
+            call_user_func_array($s, [$event, $service, $message]);
         }
     }
 
@@ -177,97 +173,56 @@ class Ganesha
      */
     public function reset(): void
     {
-        self::withGlobalLock(function (): void {
-            try {
-                $this->strategy->reset();
-            } catch (StorageException $e) {
-                $this->notify(
-                    self::EVENT_STORAGE_ERROR,
-                    '',
-                    'failed to reset : ' . $e->getMessage()
-                );
-            } catch (\Throwable $e) {
-                $this->notify(
-                    self::EVENT_STORAGE_ERROR,
-                    '',
-                    'unexpected error while resetting : ' . $e->getMessage()
-                );
-            }
-        });
-    }
-
-    /**
-     * Lightweight per-service lock to mitigate race conditions on shared counters.
-     * Uses non-blocking flock with a small timeout to avoid threads being stuck.
-     *
-     * @param callable $callback
-     * @return mixed
-     */
-    private static function withServiceLock(string $service, callable $callback)
-    {
-        $lockFile = sys_get_temp_dir() . '/ganesha_' . md5($service) . '.lock';
-        $fh = @fopen($lockFile, 'c');
-
-        if ($fh === false) {
-            // If we cannot create/open a lock file, proceed without locking to preserve availability.
-            return $callback();
-        }
-
-        $start   = microtime(true);
-        $locked  = false;
-        $timeout = 0.05; // 50ms max wait to avoid resource exhaustion
-
-        while (!($locked = @flock($fh, LOCK_EX | LOCK_NB))) {
-            if ((microtime(true) - $start) > $timeout) {
-                // Give up on locking to avoid threads stuck in retention loops
-                break;
-            }
-            usleep(1000);
+        if (!$this->acquireLock()) {
+            $this->notify(self::EVENT_STORAGE_ERROR, 'global', 'failed to acquire lock for reset');
+            return;
         }
 
         try {
-            return $callback();
+            $this->strategy->reset();
+        } catch (StorageException $e) {
+            $this->notify(self::EVENT_STORAGE_ERROR, 'global', 'failed to reset : ' . $e->getMessage());
+        } catch (\Throwable $e) {
+            $this->notify(self::EVENT_STORAGE_ERROR, 'global', 'unexpected error on reset : ' . $e->getMessage());
         } finally {
-            if ($locked) {
-                @flock($fh, LOCK_UN);
-            }
-            @fclose($fh);
+            $this->releaseLock();
         }
     }
 
     /**
-     * Global lock for operations that affect all services (e.g., reset).
-     *
-     * @param callable $callback
-     * @return mixed
+     * Acquire a simple cross‑process lock to mitigate race conditions
+     * on counters and state transitions.
      */
-    private static function withGlobalLock(callable $callback)
+    private function acquireLock(): bool
     {
-        $lockFile = sys_get_temp_dir() . '/ganesha_global.lock';
-        $fh = @fopen($lockFile, 'c');
-
-        if ($fh === false) {
-            return $callback();
+        if (self::$lockHandle === null) {
+            self::$lockHandle = @fopen(self::$lockFile, 'c');
+            if (self::$lockHandle === false) {
+                self::$lockHandle = null;
+                return false;
+            }
         }
 
-        $start   = microtime(true);
-        $locked  = false;
-        $timeout = 0.05;
+        $start = microtime(true);
+        $timeoutSeconds = 0.05; // small timeout to avoid threads stuck in retention loops
 
-        while (!($locked = @flock($fh, LOCK_EX | LOCK_NB))) {
-            if ((microtime(true) - $start) > $timeout) {
-                break;
+        do {
+            if (@flock(self::$lockHandle, LOCK_EX | LOCK_NB)) {
+                return true;
             }
-            usleep(1000);
-        }
+            usleep(1000); // brief backoff to reduce contention
+        } while ((microtime(true) - $start) < $timeoutSeconds);
 
-        try {
-            return $callback();
-        } finally {
-            if ($locked) {
-                @flock($fh, LOCK_UN);
-            }
-            @fclose($fh);
+        return false;
+    }
+
+    /**
+     * Release the previously acquired lock.
+     */
+    private function releaseLock(): void
+    {
+        if (self::$lockHandle !== null) {
+            @flock(self::$lockHandle, LOCK_UN);
         }
     }
 }
