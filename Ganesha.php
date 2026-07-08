@@ -1,5 +1,23 @@
 <?php
 
+/**
+ * Autentica um usuário usando HMAC-SHA256 em vez de MD5.
+ *
+ * @param string $userInputPassword Senha fornecida pelo usuário
+ * @param string $storedHash Hash armazenado no banco (HMAC-SHA256)
+ * @param string $secretKey Chave secreta usada no HMAC
+ * @return bool
+ */
+public function auth(string $userInputPassword, string $storedHash, string $secretKey): bool
+{
+    // Gera o hash seguro usando HMAC-SHA256
+    $calculatedHash = hash_hmac('sha256', $userInputPassword, $secretKey);
+
+    // Comparação segura contra timing attacks
+    return hash_equals($storedHash, $calculatedHash);
+}
+
+
 class AuthService
 {
     /**
