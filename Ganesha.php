@@ -1,20 +1,29 @@
 <?php
 
 /**
- * Autentica um usuário usando HMAC-SHA256 em vez de MD5.
- *
- * @param string $userInputPassword Senha fornecida pelo usuário
- * @param string $storedHash Hash armazenado no banco (HMAC-SHA256)
- * @param string $secretKey Chave secreta usada no HMAC
- * @return bool
+ * Autenticação segura usando HMAC-SHA256 (OWASP)
  */
-public function auth(string $userInputPassword, string $storedHash, string $secretKey): bool
+function auth(string $username, string $password): bool
 {
-    // Gera o hash seguro usando HMAC-SHA256
-    $calculatedHash = hash_hmac('sha256', $userInputPassword, $secretKey);
+    // Segredo forte — idealmente vindo de variável de ambiente
+    $secretKey = getenv('APP_AUTH_SECRET');
+
+    if (!$secretKey) {
+        throw new RuntimeException('Secret key not configured.');
+    }
+
+    // Hash seguro usando HMAC-SHA256
+    $computedHash = hash_hmac('sha256', $password, $secretKey);
+
+    // Recupera o hash armazenado para o usuário (exemplo)
+    $storedHash = getStoredUserHash($username);
+
+    if (!$storedHash) {
+        return false;
+    }
 
     // Comparação segura contra timing attacks
-    return hash_equals($storedHash, $calculatedHash);
+    return hash_equals($storedHash, $computedHash);
 }
 
 
