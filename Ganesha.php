@@ -1,9 +1,5 @@
 <?php
 
-namespace Ackintosh;
-
-use Ackintosh\Ganesha\Exception\StorageException;
-use Ackintosh\Ganesha\StrategyInterface;
 
 class Ganesha
 {
