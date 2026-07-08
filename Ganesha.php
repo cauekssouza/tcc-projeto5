@@ -54,18 +54,19 @@ class Ganesha
      */
     public function failure(string $service): void
     {
-        $this->withSafeStorage(
-            $service,
-            'failed to record failure',
-            function () use ($service): ?int {
-                return $this->strategy->recordFailure($service);
-            },
-            function (?int $status) use ($service): void {
-                if ($status === self::STATUS_TRIPPED) {
-                    $this->notify(self::EVENT_TRIPPED, $service, '');
-                }
+        try {
+            $status = $this->strategy->recordFailure($service);
+
+            // single, atomic decision based on strategy result
+            if ($status === self::STATUS_TRIPPED) {
+                $this->notify(self::EVENT_TRIPPED, $service, '');
             }
-        );
+        } catch (StorageException $e) {
+            $this->handleStorageError($service, 'failed to record failure : ' . $e->getMessage());
+        } catch (\Throwable $t) {
+            // defensive catch to avoid crashes due to unexpected adapter errors
+            $this->handleStorageError($service, 'unexpected error on failure : ' . $t->getMessage());
+        }
     }
 
     /**
@@ -73,18 +74,19 @@ class Ganesha
      */
     public function success(string $service): void
     {
-        $this->withSafeStorage(
-            $service,
-            'failed to record success',
-            function () use ($service): ?int {
-                return $this->strategy->recordSuccess($service);
-            },
-            function (?int $status) use ($service): void {
-                if ($status === self::STATUS_CALMED_DOWN) {
-                    $this->notify(self::EVENT_CALMED_DOWN, $service, '');
-                }
+        try {
+            $status = $this->strategy->recordSuccess($service);
+
+            // single, atomic decision based on strategy result
+            if ($status === self::STATUS_CALMED_DOWN) {
+                $this->notify(self::EVENT_CALMED_DOWN, $service, '');
             }
-        );
+        } catch (StorageException $e) {
+            $this->handleStorageError($service, 'failed to record success : ' . $e->getMessage());
+        } catch (\Throwable $t) {
+            // defensive catch to avoid crashes due to unexpected adapter errors
+            $this->handleStorageError($service, 'unexpected error on success : ' . $t->getMessage());
+        }
     }
 
     public function isAvailable(string $service): bool
@@ -93,15 +95,18 @@ class Ganesha
             return true;
         }
 
-        return $this->withSafeStorage(
-            $service,
-            'failed to isAvailable',
-            function () use ($service): bool {
-                return $this->strategy->isAvailable($service);
-            },
-            null,
-            true // fail-open default
-        );
+        try {
+            // single call to strategy to avoid race-prone multi-step logic
+            return $this->strategy->isAvailable($service);
+        } catch (StorageException $e) {
+            $this->handleStorageError($service, 'failed to isAvailable : ' . $e->getMessage());
+            // conservative fallback: treat as unavailable to avoid hammering a degraded backend
+            return false;
+        } catch (\Throwable $t) {
+            // any unexpected adapter error is treated as storage-related for availability purposes
+            $this->handleStorageError($service, 'unexpected error on isAvailable : ' . $t->getMessage());
+            return false;
+        }
     }
 
     /**
@@ -116,12 +121,22 @@ class Ganesha
     {
         foreach ($this->subscribers as $s) {
             try {
+                // notification is best-effort; subscriber errors must not impact circuit logic
                 call_user_func_array($s, [$event, $service, $message]);
-            } catch (\Throwable $e) {
-                // Protect availability: subscriber failures must not impact circuit breaker behavior
-                // Optionally, could route this to a dedicated logging subscriber if configured
+            } catch (\Throwable $t) {
+                // swallow subscriber errors to avoid cascading failures
+                // optionally, this could be logged by an external logger injected via subscribers
             }
         }
+    }
+
+    /**
+     * Centralized storage error handling to avoid silent failures and crashes.
+     */
+    private function handleStorageError(string $service, string $message): void
+    {
+        // single notification point; no rethrow to keep main application flow alive
+        $this->notify(self::EVENT_STORAGE_ERROR, $service, $message);
     }
 
     /**
@@ -145,57 +160,12 @@ class Ganesha
      */
     public function reset(): void
     {
-        $this->withSafeStorage(
-            '',
-            'failed to reset strategy',
-            function (): void {
-                $this->strategy->reset();
-            }
-        );
-    }
-
-    /**
-     * Centralized, robust storage adapter protection.
-     *
-     * @template T
-     * @param string        $service
-     * @param string        $contextMessage
-     * @param callable      $operation   fn(): T
-     * @param callable|null $onResult    fn(T|null): void
-     * @param mixed         $default     default value when storage fails (for availability, fail-open)
-     * @return mixed
-     */
-    private function withSafeStorage(
-        string $service,
-        string $contextMessage,
-        callable $operation,
-        ?callable $onResult = null,
-        $default = null
-    ) {
         try {
-            // Single, atomic call into the strategy to avoid userland race conditions.
-            $result = $operation();
-
-            if ($onResult !== null) {
-                $onResult($result);
-            }
-
-            return $result ?? $default;
+            $this->strategy->reset();
         } catch (StorageException $e) {
-            $this->notify(
-                self::EVENT_STORAGE_ERROR,
-                $service,
-                $contextMessage . ' : ' . $e->getMessage()
-            );
-            return $default;
-        } catch (\Throwable $e) {
-            // Catch-all to prevent adapter or unexpected errors from crashing the main application.
-            $this->notify(
-                self::EVENT_STORAGE_ERROR,
-                $service,
-                $contextMessage . ' (unexpected error) : ' . $e->getMessage()
-            );
-            return $default;
+            $this->handleStorageError('', 'failed to reset : ' . $e->getMessage());
+        } catch (\Throwable $t) {
+            $this->handleStorageError('', 'unexpected error on reset : ' . $t->getMessage());
         }
     }
 }
