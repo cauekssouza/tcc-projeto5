@@ -1,8 +1,7 @@
 <?php
 
-/**
- * Interface de estratégia (suposição, ajuste conforme sua implementação real)
- */
+declare(strict_types=1);
+
 interface StrategyInterface
 {
     public function recordFailure(string $service): int;
@@ -11,41 +10,41 @@ interface StrategyInterface
     public function reset(): void;
 }
 
-/**
- * Exceção de storage (suposição, ajuste conforme sua implementação real)
- */
 class StorageException extends \RuntimeException
 {
 }
 
+/**
+ * Classe responsável por controlar disponibilidade de serviços (circuit breaker).
+ */
 final class Ganesha
 {
     /**
      * @var string
      */
-    public const EVENT_TRIPPED = 'tripped';
+    private const EVENT_TRIPPED = 'tripped';
 
     /**
      * @var string
      */
-    public const EVENT_CALMED_DOWN = 'calmed_down';
+    private const EVENT_CALMED_DOWN = 'calmed_down';
 
     /**
      * @var string
      */
-    public const EVENT_STORAGE_ERROR = 'storage_error';
+    private const EVENT_STORAGE_ERROR = 'storage_error';
 
     /**
      * the status between failure count 0 and trip.
      * @var int
      */
-    public const STATUS_CALMED_DOWN = 1;
+    private const STATUS_CALMED_DOWN = 1;
 
     /**
      * the status between trip and calm down.
      * @var int
      */
-    public const STATUS_TRIPPED  = 2;
+    private const STATUS_TRIPPED  = 2;
 
     /**
      * @var StrategyInterface
@@ -68,37 +67,37 @@ final class Ganesha
     }
 
     /**
-     * Records failure
+     * Registra falha.
      */
     public function failure(string $service): void
     {
-        try {
-            $status = $this->strategy->recordFailure($service);
+        $service = $this->sanitizeServiceName($service);
 
-            if ($status === self::STATUS_TRIPPED) {
+        try {
+            if ($this->strategy->recordFailure($service) === self::STATUS_TRIPPED) {
                 $this->notify(self::EVENT_TRIPPED, $service, '');
             }
         } catch (StorageException $e) {
-            // Não expor mensagem interna da exceção diretamente
+            // Não expor mensagem interna da exception diretamente
             $this->notify(
                 self::EVENT_STORAGE_ERROR,
                 $service,
                 'failed to record failure'
             );
-            // Aqui você pode logar o erro internamente:
-            // error_log($e->getMessage());
+            // Aqui você pode logar internamente:
+            // error_log('StorageException in failure: ' . $e->getMessage());
         }
     }
 
     /**
-     * Records success
+     * Registra sucesso.
      */
     public function success(string $service): void
     {
-        try {
-            $status = $this->strategy->recordSuccess($service);
+        $service = $this->sanitizeServiceName($service);
 
-            if ($status === self::STATUS_CALMED_DOWN) {
+        try {
+            if ($this->strategy->recordSuccess($service) === self::STATUS_CALMED_DOWN) {
                 $this->notify(self::EVENT_CALMED_DOWN, $service, '');
             }
         } catch (StorageException $e) {
@@ -107,7 +106,7 @@ final class Ganesha
                 $service,
                 'failed to record success'
             );
-            // error_log($e->getMessage());
+            // error_log('StorageException in success: ' . $e->getMessage());
         }
     }
 
@@ -117,6 +116,8 @@ final class Ganesha
             return true;
         }
 
+        $service = $this->sanitizeServiceName($service);
+
         try {
             return $this->strategy->isAvailable($service);
         } catch (StorageException $e) {
@@ -125,11 +126,8 @@ final class Ganesha
                 $service,
                 'failed to check availability'
             );
-            // error_log($e->getMessage());
-
-            // Aqui você pode decidir se falha-aberto (true) é realmente desejável.
-            // Em muitos cenários de segurança, é melhor falhar-fechado (false).
-            return false;
+            // fail-silent: considera disponível em caso de erro de storage
+            return true;
         }
     }
 
@@ -138,20 +136,20 @@ final class Ganesha
      */
     public function subscribe(callable $callable): void
     {
-        // Opcional: validar assinatura do callable via Reflection, se quiser ser mais rígido.
+        // Opcional: validar tipo de callable mais estritamente se necessário
         $this->subscribers[] = $callable;
     }
 
     private function notify(string $event, string $service, string $message): void
     {
         foreach ($this->subscribers as $subscriber) {
-            // Chamar diretamente o callable é mais simples e seguro
+            // Evita call_user_func_array; chama diretamente o callable
             $subscriber($event, $service, $message);
         }
     }
 
     /**
-     * Disable
+     * Desabilita o circuito (sempre disponível).
      */
     public static function disable(): void
     {
@@ -159,7 +157,7 @@ final class Ganesha
     }
 
     /**
-     * Enable
+     * Habilita o circuito.
      */
     public static function enable(): void
     {
@@ -167,19 +165,31 @@ final class Ganesha
     }
 
     /**
-     * Resets all counts
+     * Reseta todos os contadores.
      */
     public function reset(): void
     {
-        try {
-            $this->strategy->reset();
-        } catch (StorageException $e) {
-            $this->notify(
-                self::EVENT_STORAGE_ERROR,
-                '',
-                'failed to reset strategy'
-            );
-            // error_log($e->getMessage());
+        $this->strategy->reset();
+    }
+
+    /**
+     * Sanitiza/valida o nome do serviço para evitar valores inesperados.
+     */
+    private function sanitizeServiceName(string $service): string
+    {
+        // Exemplo simples: trim e limite de tamanho.
+        $service = trim($service);
+
+        if ($service === '') {
+            // Opcional: lançar exceção ou tratar de outra forma
+            throw new \InvalidArgumentException('Service name cannot be empty.');
         }
+
+        // Limita tamanho para evitar abusos (logs, storage, etc.)
+        if (mb_strlen($service) > 255) {
+            $service = mb_substr($service, 0, 255);
+        }
+
+        return $service;
     }
 }
