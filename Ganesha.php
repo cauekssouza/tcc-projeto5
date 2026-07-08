@@ -1,49 +1,49 @@
 <?php
+declare(strict_types=1);
 
-
-class Ganesha
+final class Ganesha
 {
     /**
      * @var string
      */
-    const EVENT_TRIPPED = 'tripped';
+    public const EVENT_TRIPPED = 'tripped';
 
     /**
      * @var string
      */
-    const EVENT_CALMED_DOWN = 'calmed_down';
+    public const EVENT_CALMED_DOWN = 'calmed_down';
 
     /**
      * @var string
      */
-    const EVENT_STORAGE_ERROR = 'storage_error';
+    public const EVENT_STORAGE_ERROR = 'storage_error';
 
     /**
      * the status between failure count 0 and trip.
      * @var int
      */
-    const STATUS_CALMED_DOWN = 1;
+    public const STATUS_CALMED_DOWN = 1;
 
     /**
      * the status between trip and calm down.
      * @var int
      */
-    const STATUS_TRIPPED  = 2;
+    public const STATUS_TRIPPED  = 2;
 
     /**
      * @var StrategyInterface
      */
-    private $strategy;
+    private StrategyInterface $strategy;
 
     /**
      * @var callable[]
      */
-    private $subscribers = [];
+    private array $subscribers = [];
 
     /**
      * @var bool
      */
-    private static $disabled = false;
+    private static bool $disabled = false;
 
     public function __construct(StrategyInterface $strategy)
     {
@@ -60,7 +60,12 @@ class Ganesha
                 $this->notify(self::EVENT_TRIPPED, $service, '');
             }
         } catch (StorageException $e) {
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to record failure : ' . $e->getMessage());
+            // Não expor mensagem interna da exceção
+            $this->notify(
+                self::EVENT_STORAGE_ERROR,
+                $service,
+                'failed to record failure'
+            );
         }
     }
 
@@ -74,7 +79,12 @@ class Ganesha
                 $this->notify(self::EVENT_CALMED_DOWN, $service, '');
             }
         } catch (StorageException $e) {
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to record success : ' . $e->getMessage());
+            // Não expor mensagem interna da exceção
+            $this->notify(
+                self::EVENT_STORAGE_ERROR,
+                $service,
+                'failed to record success'
+            );
         }
     }
 
@@ -87,7 +97,12 @@ class Ganesha
         try {
             return $this->strategy->isAvailable($service);
         } catch (StorageException $e) {
-            $this->notify(self::EVENT_STORAGE_ERROR, $service, 'failed to isAvailable : ' . $e->getMessage());
+            // Não expor detalhes internos
+            $this->notify(
+                self::EVENT_STORAGE_ERROR,
+                $service,
+                'failed to check availability'
+            );
             // fail-silent
             return true;
         }
@@ -98,13 +113,20 @@ class Ganesha
      */
     public function subscribe(callable $callable): void
     {
+        // Opcional: validar tipo de callable se necessário
         $this->subscribers[] = $callable;
     }
 
     private function notify(string $event, string $service, string $message): void
     {
-        foreach ($this->subscribers as $s) {
-            call_user_func_array($s, [$event, $service, $message]);
+        foreach ($this->subscribers as $subscriber) {
+            try {
+                // Chamada direta é mais segura e clara que call_user_func_array
+                $subscriber($event, $service, $message);
+            } catch (\Throwable $t) {
+                // Evita que um subscriber mal comportado quebre o fluxo
+                // Aqui você poderia logar internamente sem expor nada ao usuário
+            }
         }
     }
 
@@ -129,6 +151,14 @@ class Ganesha
      */
     public function reset(): void
     {
-        $this->strategy->reset();
+        try {
+            $this->strategy->reset();
+        } catch (StorageException $e) {
+            $this->notify(
+                self::EVENT_STORAGE_ERROR,
+                '',
+                'failed to reset'
+            );
+        }
     }
 }
